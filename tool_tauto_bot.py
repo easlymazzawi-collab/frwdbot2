@@ -51,7 +51,14 @@ API_ID   = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-ADS_CHAT       = int(os.getenv("ADS_CHAT"))
+_ads_env = (os.getenv("ADS_CHAT") or "").strip()
+if _ads_env.startswith("@"):
+    ADS_CHAT: int | str = _ads_env
+else:
+    ADS_CHAT = int(_ads_env)
+
+# ID thực sau khi resolve (có thể khác .env nếu cache/warm dialogs)
+ads_chat_resolved: int | str | None = None
 # Session userbot cũ (giống tool__tauto_nostage: Client("test_session", ...))
 USER_SESSION   = os.getenv("USER_SESSION", "test_session")
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
@@ -409,6 +416,133 @@ async def remove_dead_channel(chat_id):
         return (removed or {}).get("title", str(chat_id))
 
 
+def get_ads_chat_id() -> int | str:
+    return ads_chat_resolved if ads_chat_resolved is not None else ADS_CHAT
+
+
+async def warm_bot_dialogs(limit: int = 500) -> int:
+    n = 0
+    try:
+        async for _ in app.get_dialogs(limit=limit):
+            n += 1
+        log("START", f"Cache {n} bot dialogs")
+    except Exception as e:
+        log("WARN", f"warm_bot_dialogs: {e}")
+    return n
+
+
+async def resolve_ads_chat_for_bot() -> bool:
+    """Tìm ADS_CHAT trong cache bot — fix Peer id invalid sau khi mới add bot."""
+    global ads_chat_resolved
+    target   = ADS_CHAT
+    bot_seen = None
+    user_ref = None
+
+    await warm_bot_dialogs()
+
+    def _match(chat) -> bool:
+        if isinstance(target, str):
+            uname = (chat.username or "").lower()
+            return uname and target.lower().lstrip("@") == uname
+        return chat.id == target
+
+    try:
+        async for d in app.get_dialogs(limit=500):
+            if _match(d.chat):
+                bot_seen = d.chat
+                break
+    except Exception as e:
+        log("WARN", f"scan dialogs: {e}")
+
+    if bot_seen:
+        ads_chat_resolved = bot_seen.id
+        log("START", f"ADS_CHAT ✓ bot thấy '{bot_seen.title}' id={ads_chat_resolved}")
+        return True
+
+    for attempt in (target,):
+        try:
+            chat = await app.get_chat(attempt)
+            ads_chat_resolved = chat.id
+            log("START", f"ADS_CHAT ✓ get_chat '{chat.title}' id={ads_chat_resolved}")
+            return True
+        except Exception as e:
+            log("WARN", f"bot get_chat({attempt}): {type(e).__name__}: {e}")
+
+    uc = await ensure_user_client()
+    if uc:
+        try:
+            user_ref = await uc.get_chat(target)
+            log("CONFIG", f"User session thấy ads: '{user_ref.title}' id={user_ref.id}")
+            if isinstance(target, int) and user_ref.id != target:
+                log("WARN", f".env ADS_CHAT={target} nhưng user thấy id={user_ref.id} — thử id đúng")
+            try:
+                chat = await app.get_chat(user_ref.id)
+                ads_chat_resolved = chat.id
+                log("START", f"ADS_CHAT ✓ (qua user id) '{chat.title}' id={ads_chat_resolved}")
+                return True
+            except Exception as e:
+                log("WARN", f"bot vẫn không thấy id={user_ref.id}: {e}")
+        except Exception as e:
+            log("WARN", f"user get_chat ads: {e}")
+
+    me = await app.get_me()
+    log("WARN", "Bot chưa resolve được ADS_CHAT")
+    log("WARN", f"  .env ADS_CHAT = {target}")
+    if user_ref:
+        log("WARN", f"  User thấy id = {user_ref.id} — sửa .env ADS_CHAT={user_ref.id}")
+    log("WARN", f"  Đảm bảo @{me.username} đã trong nhóm ads, rồi **restart bot**")
+    log("WARN", "  Hoặc gửi /checkads trong bot để chẩn đoán")
+    return False
+
+
+async def cmd_checkads(reply_chat_id: int):
+    lines = [
+        "🔍 Chẩn đoán ADS_CHAT",
+        "━━━━━━━━━━━━━━━",
+        f".env ADS_CHAT = {ADS_CHAT}",
+        f"Resolved     = {get_ads_chat_id()}",
+    ]
+    await warm_bot_dialogs(100)
+    try:
+        chat = await app.get_chat(get_ads_chat_id())
+        lines.append(f"✅ Bot get_chat OK: {chat.title} (id={chat.id})")
+    except Exception as e:
+        lines.append(f"❌ Bot get_chat FAIL: {type(e).__name__}: {e}")
+
+    groups = []
+    try:
+        async for d in app.get_dialogs(limit=80):
+            c = d.chat
+            if c.type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
+                groups.append(f"  • {c.title}  id={c.id}" + (f" @{c.username}" if c.username else ""))
+    except Exception as e:
+        lines.append(f"❌ get_dialogs: {e}")
+
+    if groups:
+        lines += ["━━━━━━━━━━━━━━━", "📋 Bot đang ở (một phần):"] + groups[:15]
+        if len(groups) > 15:
+            lines.append(f"  ... +{len(groups)-15} chat")
+
+    uc = await ensure_user_client()
+    if uc:
+        try:
+            uch = await uc.get_chat(ADS_CHAT)
+            lines += [
+                "━━━━━━━━━━━━━━━",
+                f"👤 User thấy ads: {uch.title} id={uch.id}",
+            ]
+            if isinstance(ADS_CHAT, int) and uch.id != ADS_CHAT:
+                lines.append(f"⚠️ Sửa .env: ADS_CHAT={uch.id}")
+        except Exception as e:
+            lines.append(f"❌ User không thấy ADS_CHAT: {e}")
+
+    lines += [
+        "━━━━━━━━━━━━━━━",
+        "💡 Add bot vào nhóm ads → **restart bot** → /checkads lại",
+    ]
+    await safe_send("\n".join(lines), reply_chat_id)
+
+
 def get_match_key(title: str) -> str:
     parts = title.strip().split(None, 1)
     if len(parts) >= 2:
@@ -711,7 +845,7 @@ RESERVED_CMDS = {
     "list", "listchan",
     "del", "delchan",
     "alias", "aliaschan",
-    "check", "checkchan",
+    "check", "checkchan", "checkads",
     "clean", "cleanchan",
     "skip", "next", "help", "start",
     "xdone", "zdone",
@@ -834,7 +968,7 @@ def record_failed(target_id, target_title, items):
 
 async def load_ads_into(slot):
     ads     = []
-    chat_id = slot.get("ads_chat_id") or ADS_CHAT
+    chat_id = slot.get("ads_chat_id") or get_ads_chat_id()
     last_err = None
 
     for label, client in (("bot", app), ("user", await ensure_user_client())):
@@ -1115,7 +1249,7 @@ async def build_sequence(content_per_ads=1, mode="normal", chat_id: int | None =
     chat_id      = slot.get("user_chat_id") or chat_id
     contents     = slot["content_msgs"]
     n            = len(contents)
-    ads_chat     = slot["ads_chat_id"] or ADS_CHAT
+    ads_chat     = slot["ads_chat_id"] or get_ads_chat_id()
     content_chat = chat_id
     media_cnt    = slot.get("total_media_count", 0)
     media_str    = f"{n} bài / {media_cnt} media" if media_cnt else f"{n} bài"
@@ -2183,8 +2317,8 @@ async def handler(client, msg: Message):
         if not slot["waiting"]:
             return
 
-        if msg.forward_from_chat and msg.forward_from_chat.id == ADS_CHAT:
-            slot["ads_chat_id"] = ADS_CHAT
+        if msg.forward_from_chat and msg.forward_from_chat.id == get_ads_chat_id():
+            slot["ads_chat_id"] = get_ads_chat_id()
             await load_ads_into(slot)
             return
 
@@ -2451,6 +2585,10 @@ async def handler(client, msg: Message):
         await safe_send("🔍 Bắt đầu check ở nền.", chat_id)
         return
 
+    if text == "/checkads":
+        await cmd_checkads(chat_id)
+        return
+
     if waiting_slot(chat_id):
         if text == "/skip":
             ws = waiting_slot(chat_id)
@@ -2524,7 +2662,7 @@ async def handler(client, msg: Message):
 # ─────────────────────────────────────────────────────────
 
 async def main():
-    global _global_bucket, ALLOWED_USER_IDS
+    global _global_bucket, ALLOWED_USER_IDS, ads_chat_resolved
     _global_bucket = TokenBucket(FWD_GLOBAL_RATE, FWD_GLOBAL_BURST)
 
     if not BOT_TOKEN:
@@ -2554,12 +2692,7 @@ async def main():
     me = await app.get_me()
     log("START", f"Bot chạy | @{me.username}")
 
-    try:
-        await app.get_chat(ADS_CHAT)
-        log("START", "Bot trong ADS_CHAT ✓ (copy ads OK)")
-    except Exception as e:
-        log("WARN", f"Bot chưa vào ADS_CHAT: {e}")
-        log("WARN", "→ Thêm @{} vào nhóm ads để copy ads ra kênh".format(me.username or "bot"))
+    await resolve_ads_chat_for_bot()
 
     asyncio.ensure_future(task_auto_sync_folders())
     asyncio.ensure_future(task_auto_clean_dead())
