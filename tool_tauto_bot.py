@@ -51,12 +51,14 @@ API_ID   = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+ADS_CHAT       = int(os.getenv("ADS_CHAT"))
+# Session userbot cũ (giống tool__tauto_nostage: Client("test_session", ...))
+USER_SESSION   = os.getenv("USER_SESSION", "test_session")
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+
+# ALLOWED_USER_IDS: nếu trống → tự lấy từ user session khi start
 _allowed_raw = os.getenv("ALLOWED_USER_IDS") or os.getenv("ALLOWED_USER_ID") or ""
 ALLOWED_USER_IDS = {int(x.strip()) for x in _allowed_raw.split(",") if x.strip()}
-
-ADS_CHAT       = int(os.getenv("ADS_CHAT"))
-USER_SESSION   = os.getenv("USER_SESSION", "user_session")
-SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
 CHANNELS_FILE  = "channels.json"
 FOLDERS_FILE   = "folders.json"
@@ -244,7 +246,61 @@ def reset_state(chat_id: int):
 
 
 def is_allowed(user_id: int) -> bool:
-    return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS
+    if not ALLOWED_USER_IDS:
+        return False
+    return user_id in ALLOWED_USER_IDS
+
+
+def _session_db_path(name: str) -> str:
+    return f"{name}.session"
+
+
+def _repair_session_db(session_name: str):
+    """Sửa schema SQLite session cũ (lỗi 'no such column: number')."""
+    path = _session_db_path(session_name)
+    if not os.path.exists(path):
+        return
+    try:
+        import sqlite3
+        conn = sqlite3.connect(path)
+        cur  = conn.cursor()
+        cur.execute("PRAGMA table_info(sessions)")
+        cols = {row[1] for row in cur.fetchall()}
+        for col, typ in (
+            ("number", "TEXT"),
+            ("takeout_id", "INTEGER"),
+            ("last_update", "INTEGER"),
+        ):
+            if col not in cols:
+                cur.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typ}")
+        conn.commit()
+        conn.close()
+        log("USER", f"Đã migrate session DB: {path}")
+    except Exception as e:
+        log("WARN", f"session migrate {path}: {e}")
+
+
+def _resolve_user_session_name() -> str | None:
+    if SESSION_STRING:
+        return None
+    candidates = []
+    if os.getenv("USER_SESSION"):
+        candidates.append(USER_SESSION)
+    candidates.extend(["test_session", "user_session", USER_SESSION])
+    seen = set()
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        if os.path.exists(_session_db_path(name)):
+            return name
+    return USER_SESSION if os.path.exists(_session_db_path(USER_SESSION)) else None
+
+
+async def _reader_client() -> Client:
+    """Client đọc dữ liệu (folder, ads, topic) — ưu tiên user session."""
+    uc = await ensure_user_client()
+    return uc or app
 
 
 # ─────────────────────────────────────────────────────────
@@ -391,16 +447,53 @@ async def resolve_forward_topic(client, msg: Message):
             return (None, None, None)
         src_id = msg.forward_from_chat.id
         smid   = msg.forward_from_message_id
-        omsg   = await client.get_messages(src_id, smid)
-        if not omsg:
+        reader = await _reader_client()
+
+        try:
+            omsg = await reader.get_messages(src_id, smid)
+            if omsg and omsg.topic:
+                top_id    = omsg.topic.id
+                top_title = omsg.topic.title or f"topic {top_id}"
+                _topic_title_cache[top_id] = top_title
+                return (src_id, top_id, top_title)
+        except Exception as e:
+            log("WARN", f"resolve_forward_topic get_messages: {e}")
+
+        uc = await ensure_user_client()
+        if not uc:
             return (src_id, None, None)
-        top_id = None
-        if omsg.topic:
-            top_id    = omsg.topic.id
-            top_title = omsg.topic.title or f"topic {top_id}"
-            _topic_title_cache[top_id] = top_title
-            return (src_id, top_id, top_title)
-        return (src_id, None, None)
+
+        from pyrogram.raw import functions as fn, types as tt
+        try:
+            ipc = await uc.resolve_peer(src_id)
+            if not hasattr(ipc, "channel_id"):
+                return (src_id, None, None)
+            inch = tt.InputChannel(channel_id=ipc.channel_id, access_hash=ipc.access_hash)
+            og   = await uc.invoke(fn.channels.GetMessages(
+                channel=inch, id=[tt.InputMessageID(id=smid)]
+            ))
+            omsg = og.messages[0]
+            rt   = getattr(omsg, "reply_to", None)
+            if rt is not None and getattr(rt, "forum_topic", False):
+                top_id = (getattr(rt, "reply_to_top_id", None)
+                          or getattr(rt, "reply_to_msg_id", None))
+            else:
+                top_id = 1
+            title = _topic_title_cache.get(top_id)
+            if title is None:
+                try:
+                    ft = await uc.invoke(fn.channels.GetForumTopicsByID(
+                        channel=inch, topics=[top_id]
+                    ))
+                    title = (ft.topics[0].title if getattr(ft, "topics", None)
+                             else f"topic {top_id}")
+                except Exception:
+                    title = "General" if top_id == 1 else f"topic {top_id}"
+                _topic_title_cache[top_id] = title
+            return (src_id, top_id, title)
+        except Exception as e:
+            log("WARN", f"resolve_forward_topic raw: {type(e).__name__}: {e}")
+            return (src_id, None, None)
     except Exception as e:
         log("WARN", f"resolve_forward_topic: {type(e).__name__}: {e}")
         return (None, None, None)
@@ -742,16 +835,26 @@ def record_failed(target_id, target_title, items):
 async def load_ads_into(slot):
     ads     = []
     chat_id = slot.get("ads_chat_id") or ADS_CHAT
-    try:
-        async for msg in app.get_chat_history(chat_id, limit=200):
-            if not msg.empty and not msg.service:
-                ads.append(msg.id)
-        ads.reverse()
-        slot["ads_msgs"]    = ads
-        slot["ads_chat_id"] = chat_id
-        log("ADS", f"Load xong {len(ads)} ads")
-    except Exception as e:
-        log("ERROR", f"load_ads: {e}")
+    last_err = None
+
+    for label, client in (("bot", app), ("user", await ensure_user_client())):
+        if client is None:
+            continue
+        try:
+            ads = []
+            async for msg in client.get_chat_history(chat_id, limit=200):
+                if not msg.empty and not msg.service:
+                    ads.append(msg.id)
+            ads.reverse()
+            slot["ads_msgs"]    = ads
+            slot["ads_chat_id"] = chat_id
+            log("ADS", f"Load xong {len(ads)} ads qua {label}")
+            return
+        except Exception as e:
+            last_err = e
+            log("WARN", f"load_ads qua {label}: {type(e).__name__}: {e}")
+
+    log("ERROR", f"load_ads thất bại: {last_err}")
 
 
 async def load_ads(chat_id: int):
@@ -1341,8 +1444,14 @@ async def cmd_select_by_cmd(slot, cmd_key: str):
 # ─────────────────────────────────────────────────────────
 
 async def _fetch_folder_chats(slug):
+    uc = await ensure_user_client()
+    if not uc:
+        raise RuntimeError(
+            "Cần user session (test_session.session) để đọc folder — "
+            "bot không gọi được CheckChatlistInvite"
+        )
     from pyrogram.raw import functions as raw_fn
-    result = await app.invoke(raw_fn.chatlists.CheckChatlistInvite(slug=slug))
+    result = await uc.invoke(raw_fn.chatlists.CheckChatlistInvite(slug=slug))
     return getattr(result, "title", slug) or slug, getattr(result, "chats", [])
 
 
@@ -1426,23 +1535,42 @@ async def ensure_user_client() -> "Client | None":
     try:
         if SESSION_STRING:
             user_app = Client(
-                "user_helper",
+                USER_SESSION or "test_session",
                 api_id=API_ID,
                 api_hash=API_HASH,
                 session_string=SESSION_STRING,
             )
-        elif os.path.exists(f"{USER_SESSION}.session"):
-            user_app = Client(USER_SESSION, api_id=API_ID, api_hash=API_HASH)
         else:
-            return None
+            session_name = _resolve_user_session_name()
+            if not session_name:
+                return None
+            _repair_session_db(session_name)
+            user_app = Client(session_name, api_id=API_ID, api_hash=API_HASH)
         await user_app.start()
         me = await user_app.get_me()
-        log("USER", f"User session ✓ id={me.id}")
+        sess_tag = "string" if SESSION_STRING else (_resolve_user_session_name() or USER_SESSION)
+        log("USER", f"User session ✓ {sess_tag} id={me.id}")
         return user_app
     except Exception as e:
         log("ERROR", f"ensure_user_client: {type(e).__name__}: {e}")
+        if "no such column" in str(e).lower():
+            log("ERROR", "Session cũ lỗi schema — thử xóa file .session và login lại, "
+                         "hoặc pip install pyrogram==2.0.106 giống tool cũ")
         user_app = None
         return None
+
+
+async def sync_allowed_from_user():
+    global ALLOWED_USER_IDS
+    if ALLOWED_USER_IDS:
+        return
+    uc = await ensure_user_client()
+    if not uc:
+        return
+    me = await uc.get_me()
+    ALLOWED_USER_IDS = {me.id}
+    register_notify_user(me.id)
+    log("CONFIG", f"ALLOWED_USER_IDS tự động = {me.id} (từ {USER_SESSION})")
 
 
 def _bot_member_ok(member) -> bool:
@@ -1732,9 +1860,20 @@ async def cmd_addchan(raw: str, reply_chat_id: int):
     channels               = load_channels()
     added, skipped, failed = [], [], []
     await safe_send(f"⏳ Đang xử lý {len(identifiers)} kênh...", reply_chat_id)
+    uc = await ensure_user_client()
     for ident in identifiers:
         try:
-            chat = await app.get_chat(ident)
+            chat = None
+            for client in (app, uc):
+                if client is None:
+                    continue
+                try:
+                    chat = await client.get_chat(ident)
+                    break
+                except Exception:
+                    continue
+            if chat is None:
+                raise ValueError("bot/user đều không resolve được")
             if any(str(ch["id"]) == str(chat.id) for ch in channels):
                 skipped.append(f"⚠️ {chat.title} (đã có)")
                 continue
@@ -2324,17 +2463,31 @@ async def handler(client, msg: Message):
 # ─────────────────────────────────────────────────────────
 
 async def main():
-    global _global_bucket
+    global _global_bucket, ALLOWED_USER_IDS
     _global_bucket = TokenBucket(FWD_GLOBAL_RATE, FWD_GLOBAL_BURST)
 
     if not BOT_TOKEN:
         log("ERROR", "Thiếu BOT_TOKEN trong .env")
         return
-    if not ALLOWED_USER_IDS:
-        log("WARN", "ALLOWED_USER_IDS trống — mọi user đều bị chặn!")
 
-    log("CONFIG", f"ADS_CHAT={ADS_CHAT} | allowed={ALLOWED_USER_IDS}")
+    log("CONFIG", f"ADS_CHAT={ADS_CHAT} | USER_SESSION={USER_SESSION}")
     ensure_topic_map_txt()
+
+    # User session (test_session) — folder, ads đọc, topic raw, botadd
+    if SESSION_STRING or _resolve_user_session_name():
+        uc = await ensure_user_client()
+        if uc:
+            await sync_allowed_from_user()
+            log("START", "User session OK — folder sync / ads đọc / topic / botadd")
+        else:
+            log("WARN", "Có file session nhưng không start được — xem lỗi phía trên")
+    else:
+        log("WARN", f"Không thấy {_session_db_path('test_session')} — copy file session từ tool cũ")
+
+    if not ALLOWED_USER_IDS:
+        log("WARN", "ALLOWED_USER_IDS trống — set trong .env hoặc sửa session user")
+    else:
+        log("CONFIG", f"allowed={ALLOWED_USER_IDS}")
 
     await app.start()
     me = await app.get_me()
@@ -2342,18 +2495,10 @@ async def main():
 
     try:
         await app.get_chat(ADS_CHAT)
-        log("START", "Resolved ADS_CHAT ✓")
+        log("START", "Bot trong ADS_CHAT ✓ (copy ads OK)")
     except Exception as e:
-        log("WARN", f"ADS_CHAT chưa accessible: {e} — thêm bot vào nhóm ads!")
-
-    if SESSION_STRING or os.path.exists(f"{USER_SESSION}.session"):
-        uc = await ensure_user_client()
-        if uc:
-            log("START", "User session ✓ — /botadd /botaddf khả dụng")
-        else:
-            log("WARN", "User session file/string có nhưng không start được")
-    else:
-        log("WARN", "Chưa có user session — /botadd /botaddf sẽ báo hướng dẫn setup")
+        log("WARN", f"Bot chưa vào ADS_CHAT: {e}")
+        log("WARN", "→ Thêm @{} vào nhóm ads để copy ads ra kênh".format(me.username or "bot"))
 
     asyncio.ensure_future(task_auto_sync_folders())
     asyncio.ensure_future(task_auto_clean_dead())

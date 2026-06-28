@@ -17,9 +17,13 @@ Nâng cấp từ userbot `tool__tauto_nostage.py` v20 sang **bot Telegram** phâ
 
 1. Tạo bot qua [@BotFather](https://t.me/BotFather), lấy `BOT_TOKEN`
 2. Thêm bot làm **admin** các kênh đích (quyền đăng bài)
-3. Thêm bot vào **nhóm ads** (`ADS_CHAT`)
-4. Lấy `API_ID` / `API_HASH` từ [my.telegram.org](https://my.telegram.org)
-5. Lấy `ALLOWED_USER_IDS` từ [@userinfobot](https://t.me/userinfobot)
+3. Thêm bot vào **nhóm ads** (`ADS_CHAT`) — để copy ads ra kênh
+4. Copy file **`test_session.session`** từ tool userbot cũ vào cùng thư mục
+5. `API_ID` / `API_HASH` từ [my.telegram.org](https://my.telegram.org)
+
+**Kiến trúc hybrid:**
+- **Bot** (`@upbaibot`) — nhận bài, lệnh, copy ra kênh
+- **User session** (`test_session`) — đọc folder, load ads, detect topic, `/botadd`
 
 ## Cài đặt
 
