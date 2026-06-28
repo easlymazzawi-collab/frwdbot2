@@ -2381,6 +2381,18 @@ def _private_allowed_filter():
     return filters.create(func)
 
 
+def _ads_chat_filter():
+    async def func(_, __, msg: Message):
+        return bool(msg.chat and _is_ads_chat_id(msg.chat.id))
+    return filters.create(func)
+
+
+@app.on_message(_ads_chat_filter())
+async def ads_chat_wakeup(client, msg: Message):
+    """Tin mới trong nhóm ads → bot cache peer (fix Peer id invalid lúc start)."""
+    await mark_ads_chat_live(msg.chat.id, msg.chat.title or "")
+
+
 @app.on_message(_private_allowed_filter())
 async def handler(client, msg: Message):
     chat_id = msg.chat.id
