@@ -86,9 +86,13 @@ FWD_GLOBAL_BURST            = 15
 DEAD_CHANNEL_ERRORS = (
     ChannelInvalid,
     ChannelPrivate,
-    PeerIdInvalid,
     UserBannedInChannel,
 )
+
+# Peer chưa cache — warm/import rồi retry, KHÔNG coi là kênh chết
+PEER_RETRY_ERRORS = (PeerIdInvalid,)
+
+COPY_PEER_RETRIES = 3
 
 SKIP_NOT_DEAD_ERRORS = (
     ChatWriteForbidden,
@@ -307,8 +311,10 @@ def _resolve_user_session_name() -> str | None:
 
 
 async def _client_for_chat(chat_id) -> Client:
-    """Bot cho content DM; user fallback cho ADS_CHAT nếu bot chưa vào nhóm."""
-    if _is_ads_chat_id(chat_id) and not await bot_has_ads_access():
+    """Đọc metadata. Content DM → bot. Ads → bot hoặc user."""
+    if _is_user_dm_chat(chat_id):
+        return app
+    if _is_ads_chat_id(chat_id) and not ads_bot_accessible:
         uc = await ensure_user_client()
         if uc:
             return uc
@@ -559,26 +565,25 @@ async def resolve_ads_chat_for_bot() -> bool:
 
 
 async def cmd_checkads(reply_chat_id: int):
-    global ads_chat_resolved, ads_bot_accessible
+    chat = await _resolve_bot_ads_chat()
 
     lines = [
         "🔍 Chẩn đoán ADS_CHAT",
         "━━━━━━━━━━━━━━━",
         f".env ADS_CHAT = {ADS_CHAT}",
         f"Resolved     = {get_ads_chat_id()}",
-        f"Bot copy ads = {'✅' if ads_bot_accessible else '⚠️ user fallback'}",
+        f"Bot copy ads = {'✅ bot' if ads_bot_accessible else '⚠️ user fallback'}",
     ]
 
-    chat = await _resolve_bot_ads_chat()
-    if chat and ads_bot_accessible:
-        title = getattr(chat, "title", None) or ads_chat_resolved
+    if ads_bot_accessible:
+        title = (getattr(chat, "title", None) if chat else None) or ads_chat_resolved
         lines.append(f"✅ Bot OK: {title} (id={ads_chat_resolved})")
     else:
         lines.append("❌ Bot chưa copy ads trực tiếp được")
         try:
             me = await app.get_me()
             await app.get_chat_member(get_ads_chat_id(), me.id)
-            lines.append("⚠️ Bot có trong nhóm nhưng chưa cache peer — restart hoặc ADS_CHAT=@username")
+            lines.append("⚠️ Bot trong nhóm nhưng chưa cache peer — gửi 1 tin trong nhóm ads")
         except Exception as e:
             lines.append(f"❌ Bot chưa trong nhóm ads: {type(e).__name__}")
 
@@ -610,6 +615,13 @@ def get_match_key(title: str) -> str:
     if len(parts) >= 2:
         return parts[1].strip().lower()
     return (parts[0] if parts else "").lower()
+
+
+def _lookup_channel(chat_id):
+    for ch in load_channels():
+        if str(ch.get("id")) == str(chat_id):
+            return ch
+    return None
 
 
 def find_channels(query: str):
@@ -1037,7 +1049,7 @@ async def load_ads_into(slot):
     ads      = []
     chat_id  = slot.get("ads_chat_id") or get_ads_chat_id()
     last_err = None
-    bot_copy = await bot_has_ads_access()
+    bot_copy = ads_bot_accessible
     uc       = await ensure_user_client()
     # User trước (đủ lịch sử), bot chỉ để fallback nếu không có user session
     order    = (("user", uc), ("bot", app)) if uc else (("bot", app),)
@@ -1053,9 +1065,9 @@ async def load_ads_into(slot):
             ads.reverse()
             slot["ads_msgs"]     = ads
             slot["ads_chat_id"]  = chat_id
-            slot["ads_bot_copy"] = bot_copy
+            slot["ads_bot_copy"] = ads_bot_accessible
             log("ADS", f"Load {len(ads)} ads qua {label}"
-                       + (f" | copy ads: {'bot' if bot_copy else 'user'}"))
+                       + (f" | gửi ads: {'bot' if ads_bot_accessible else 'user copy_message'}"))
             if label == "user" and bot_copy:
                 log("ADS", "Đọc ads qua user (đủ lịch sử) — copy qua bot")
             elif not bot_copy:
@@ -1162,26 +1174,153 @@ async def update_menu(n, chat_id: int):
 
 
 # ─────────────────────────────────────────────────────────
-# Copy core — copy_message / copy_media_group giữ raw entities
+# Copy core — CHỈ copy_message / copy_media_group (giữ emoji premium)
 # ─────────────────────────────────────────────────────────
+
+def _is_user_dm_chat(chat_id) -> bool:
+    return isinstance(chat_id, int) and chat_id > 0
+
+
+async def _pick_copy_client(from_chat) -> Client:
+    """Content DM → chỉ bot. Ads → bot nếu live, else user."""
+    if _is_user_dm_chat(from_chat):
+        return app
+    if _is_ads_chat_id(from_chat):
+        if ads_bot_accessible:
+            return app
+        uc = await ensure_user_client()
+        if uc:
+            return uc
+    return app
+
+
+async def _import_peer(src_client: Client, dst_client: Client, chat_id) -> bool:
+    """Copy access_hash peer từ session nguồn sang session đích."""
+    if src_client is dst_client:
+        return True
+    try:
+        peer = await src_client.resolve_peer(chat_id)
+        await dst_client.storage.update_peers([peer])
+        return True
+    except Exception:
+        return False
+
+
+async def _warm_peer(client: Client, chat_id, username: str | None = None) -> bool:
+    """Cache peer: get_chat / @username / resolve / import từ user session."""
+    if chat_id is None:
+        return False
+
+    identifiers: list = []
+    if isinstance(chat_id, str) and str(chat_id).startswith("@"):
+        identifiers.append(chat_id)
+    else:
+        identifiers.append(chat_id)
+        if username:
+            u = username if username.startswith("@") else f"@{username}"
+            identifiers.append(u)
+
+    for ident in identifiers:
+        try:
+            await client.get_chat(ident)
+            return True
+        except Exception:
+            pass
+
+    try:
+        await client.resolve_peer(chat_id)
+        return True
+    except Exception:
+        pass
+
+    if client is app:
+        uc = await ensure_user_client()
+        if uc and await _import_peer(uc, app, chat_id):
+            try:
+                await app.resolve_peer(chat_id)
+                return True
+            except Exception:
+                pass
+        if isinstance(chat_id, int) and chat_id < 0:
+            try:
+                me = await app.get_me()
+                await app.get_chat_member(chat_id, me.id)
+                return True
+            except Exception:
+                pass
+
+    return False
+
+
+async def _warm_copy_peers(client: Client, target_id, from_chat) -> None:
+    ch    = _lookup_channel(target_id)
+    uname = (ch or {}).get("username") or ""
+    await _warm_peer(client, target_id, uname or None)
+    await _warm_peer(client, from_chat)
+
+
+async def _warm_channels_for_copy(channel_ids: list) -> None:
+    await _resolve_bot_ads_chat()
+    for cid in channel_ids:
+        ch    = _lookup_channel(cid)
+        uname = (ch or {}).get("username") or ""
+        if not await _warm_peer(app, cid, uname or None):
+            log("WARN", f"warm peer ch={cid} — chưa chắc OK")
+    ads_id = get_ads_chat_id()
+    if ads_id and not ads_bot_accessible:
+        uc = await ensure_user_client()
+        if uc:
+            await _import_peer(uc, app, ads_id)
+
+
+async def _warm_all_saved_channels() -> None:
+    channels = load_channels()
+    if not channels:
+        return
+    log("START", f"Warm peer {len(channels)} kênh đã lưu...")
+    await _warm_channels_for_copy([ch["id"] for ch in channels])
+
+
+async def _clients_for_copy(from_chat) -> list:
+    if _is_user_dm_chat(from_chat):
+        return [app]
+    clients: list = []
+    if _is_ads_chat_id(from_chat):
+        if ads_bot_accessible:
+            clients.append(app)
+        uc = await ensure_user_client()
+        if uc and uc not in clients:
+            clients.append(uc)
+        return clients or [app]
+    c = await _pick_copy_client(from_chat)
+    return [c]
+
 
 async def _try_copy_one(target_id, from_chat, msg_id, is_album: bool,
                         bucket: TokenBucket, last_ts: list):
-    if is_album:
-        try:
-            album = await app.get_media_group(from_chat, msg_id)
-            n_items = len(album) if album else 1
-        except Exception:
-            n_items = 1
-    else:
-        n_items = 1
+    clients_try = await _clients_for_copy(from_chat)
+    ch          = _lookup_channel(target_id)
+    uname       = (ch or {}).get("username") or ""
+    await _warm_peer(app, target_id, uname or None)
 
-    async def _do_copy(client: Client):
+    n_items = 1
+    if is_album:
+        reader = await _client_for_chat(from_chat)
+        try:
+            mg = await reader.get_media_group(from_chat, msg_id)
+            if mg:
+                n_items = len(mg)
+        except Exception:
+            pass
+
+    async def _do_copy(c: Client):
         if is_album:
-            copied = await client.copy_media_group(target_id, from_chat, msg_id)
+            copied = await c.copy_media_group(target_id, from_chat, msg_id)
             return len(copied) if copied else n_items
-        await client.copy_message(target_id, from_chat, msg_id)
+        await c.copy_message(target_id, from_chat, msg_id)
         return 1
+
+    last_err = None
 
     while True:
         elapsed = time.monotonic() - last_ts[0]
@@ -1199,45 +1338,57 @@ async def _try_copy_one(target_id, from_chat, msg_id, is_album: bool,
             log("FLOOD", f"Chờ flood gate {remain:.0f}s — copy")
             await asyncio.sleep(remain)
 
-        try:
-            n = await _do_copy(app)
-            return n, None
+        for peer_attempt in range(COPY_PEER_RETRIES):
+            for c in clients_try:
+                await _warm_copy_peers(c, target_id, from_chat)
+                tag = "bot" if c is app else "user"
+                try:
+                    n = await _do_copy(c)
+                    if _is_ads_chat_id(from_chat) and c is not app:
+                        log("COPY", f"  ads fallback ({tag}) src={from_chat}")
+                    return n, None
+                except FloodWait as e:
+                    wait = e.value + 3
+                    log("FLOOD", f"FloodWait {wait}s — copy → global wait")
+                    await flood_wait_globally(wait, source="copy")
+                    last_err = e
+                    break
+                except DEAD_CHANNEL_ERRORS as e:
+                    err = f"{type(e).__name__}: {str(e)[:80]}"
+                    log("DEAD", f"Dead channel khi copy: {err}")
+                    return 0, err
+                except SKIP_NOT_DEAD_ERRORS as e:
+                    log("SKIP", f"Skip channel ({type(e).__name__}) khi copy")
+                    return 0, f"SKIP:{type(e).__name__}"
+                except PEER_RETRY_ERRORS as e:
+                    last_err = e
+                    log("WARN", f"PeerIdInvalid {from_chat}/{msg_id} → warm retry {peer_attempt+1}/{COPY_PEER_RETRIES}")
+                except Exception as e:
+                    last_err = e
+                    log("WARN", f"copy {from_chat}/{msg_id} ({tag}): {type(e).__name__}: {e}")
 
-        except FloodWait as e:
-            wait = e.value + 3
-            log("FLOOD", f"FloodWait {wait}s — copy → global wait")
-            await flood_wait_globally(wait, source="copy")
+            if isinstance(last_err, FloodWait):
+                break
+            if peer_attempt < COPY_PEER_RETRIES - 1:
+                await asyncio.sleep(1.0 + peer_attempt)
+
+        if isinstance(last_err, FloodWait):
             continue
 
-        except DEAD_CHANNEL_ERRORS as e:
-            err = f"{type(e).__name__}: {str(e)[:80]}"
-            log("DEAD", f"Dead channel khi copy: {err}")
-            return 0, err
-
-        except SKIP_NOT_DEAD_ERRORS as e:
-            log("SKIP", f"Skip channel ({type(e).__name__}) khi copy")
-            return 0, f"SKIP:{type(e).__name__}"
-
-        except Exception as e:
-            if _is_ads_chat_id(from_chat):
-                uc = await ensure_user_client()
-                if uc:
-                    try:
-                        n = await _do_copy(uc)
-                        log("COPY", f"  ads fallback user session src={from_chat}")
-                        return n, None
-                    except Exception as e2:
-                        log("ERROR", f"copy ads user fallback: {type(e2).__name__}: {e2}")
-            log("ERROR", f"copy {from_chat}/{msg_id} fail: {type(e).__name__}: {str(e)[:100]}")
-            return 0, None
+        log("ERROR", f"copy fail {from_chat}/{msg_id}: {last_err}")
+        return 0, None
 
 
 async def copy_sequence_to_channel(target_id, sequence):
     """
-    Copy sequence tới target_id bằng copy_message / copy_media_group.
-    sequence: list[(src_chat, msg_id)] — bản sao riêng cho mỗi kênh.
-    Returns: (sent_count, failed_items, dead_reason)
+    Copy sequence tới target_id — CHỈ copy_message / copy_media_group.
+    Content: luôn qua bot (DM). Ads: bot nếu live, else user copy_message.
     """
+    await _resolve_bot_ads_chat()
+    ch    = _lookup_channel(target_id)
+    uname = (ch or {}).get("username") or ""
+    await _warm_peer(app, target_id, uname or None)
+
     bucket  = _global_bucket or TokenBucket(FWD_GLOBAL_RATE, FWD_GLOBAL_BURST)
     last_ts = [0.0]
 
@@ -1298,6 +1449,16 @@ async def copy_sequence_to_channel(target_id, sequence):
                 already_expanded = {ex[3] for ex in expanded}
                 remaining = [s for s in sequence if s not in already_expanded and s != seq_item]
                 return 0, failed_items + [seq_item] + remaining, dead_reason
+
+            except PEER_RETRY_ERRORS as e:
+                last_err = e
+                backoff  = 1.5 * (attempt + 1)
+                log("WARN", f"expand peer retry {src_chat}/{msg_id}: {e} — {backoff:.1f}s")
+                await asyncio.sleep(backoff)
+                uc = await ensure_user_client()
+                if uc:
+                    await _import_peer(uc, reader, src_chat)
+                await _warm_peer(reader, src_chat)
 
             except SKIP_NOT_DEAD_ERRORS:
                 return 0, [], None
@@ -1652,6 +1813,7 @@ async def _start_forward(slot, results, query_display: str = ""):
     new_s["user_chat_id"] = chat_id
     state["slots"].append(new_s)
     await load_ads_into(new_s)
+    await _warm_channels_for_copy([ch["id"] for ch in results])
     asyncio.ensure_future(do_forward_job(slot, results))
 
 
@@ -2193,8 +2355,10 @@ async def cmd_addchan(raw: str, reply_chat_id: int):
 
 async def _probe_channel(ch):
     last_err = None
+    uname = ch.get("username") or ""
     for attempt in range(3):
         try:
+            await _warm_peer(app, ch["id"], uname or None)
             chat = await app.get_chat(ch["id"])
             return ("alive", chat)
         except FloodWait as e:
@@ -2202,13 +2366,19 @@ async def _probe_channel(ch):
             log("CHECK", f"FloodWait {wait}s — retry {attempt+1}/3")
             await asyncio.sleep(wait)
             last_err = e
+        except PEER_RETRY_ERRORS as e:
+            last_err = e
+            uc = await ensure_user_client()
+            if uc:
+                await _import_peer(uc, app, ch["id"])
+            await asyncio.sleep(1.0 + attempt)
         except DEAD_CHANNEL_ERRORS as e:
             return ("dead", f"{type(e).__name__}: {str(e)[:80]}")
         except SKIP_NOT_DEAD_ERRORS as e:
             return ("unknown", f"{type(e).__name__}: {str(e)[:80]}")
         except Exception as e:
             return ("unknown", f"{type(e).__name__}: {str(e)[:80]}")
-    return ("unknown", f"FloodWait persistent: {last_err}")
+    return ("unknown", f"probe fail: {last_err}")
 
 
 async def cmd_checkchan(reply_chat_id: int, auto_clean: bool = False, silent: bool = False):
@@ -2799,6 +2969,7 @@ async def main():
     log("START", f"Bot chạy | @{me.username}")
 
     await resolve_ads_chat_for_bot()
+    await _warm_all_saved_channels()
 
     asyncio.ensure_future(task_auto_sync_folders())
     asyncio.ensure_future(task_auto_clean_dead())
