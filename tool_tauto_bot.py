@@ -1,23 +1,19 @@
 """
-tool_tauto_bot.py  v1 (bot + copy_message)
+tool_tauto_bot.py  v1 (hybrid bot + user copy)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Nâng cấp từ userbot v20 → Bot phân phối bài:
+Nâng cấp từ userbot v20 → Bot nhận bài + user session copy ra kênh:
 
-  • Forward bài vào BOT (DM) thay vì Saved Messages
-  • Lệnh tương tác trực tiếp với bot — KHÔNG cần nhóm trung gian
-  • Bot thêm vào nhóm ads + các kênh đích
-  • Phân phối đa kênh bằng copy_message / copy_media_group
-    → giữ 100% emoji premium, entities, caption (server-side copy)
+  • Forward bài vào BOT (DM) — lệnh tương tác, không cần nhóm trung gian
+  • Bot KHÔNG giữ emoji premium khi copy ra kênh/nhóm (giới hạn Bot API)
+  • User session (test_session) copy_message / copy_media_group ra kênh
+    → giữ emoji premium, entities, caption (cần tài khoản Premium)
+  • User session: folder sync, ads đọc, topic, /botadd
 
 Luồng:
   1. Forward bài vào bot (chat riêng)
   2. /done* / /xdone / /zdone  → xếp sequence
-  3. Gõ tên kênh / tap lệnh   → copy ra kênh đích
+  3. Gõ tên kênh / tap lệnh   → user copy ra kênh đích
   4. Auto reset, sẵn sàng batch tiếp
-
-Lệnh: /add /addf /list /del /alias /check /clean
-      /botadd /botaddf — auto mời bot + cấp admin (cần user session)
-      /map /mapgen /xepbai /xepbaiwhite /all /next /skip /help
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -138,6 +134,7 @@ app = Client(
 )
 
 user_app: "Client | None" = None
+_bot_self_id: int | None = None
 
 fwd_lock             = asyncio.Lock()
 _channels_write_lock = asyncio.Lock()
@@ -308,6 +305,14 @@ def _resolve_user_session_name() -> str | None:
         if os.path.exists(_session_db_path(name)):
             return name
     return USER_SESSION if os.path.exists(_session_db_path(USER_SESSION)) else None
+
+
+async def get_bot_id() -> int:
+    global _bot_self_id
+    if _bot_self_id is None:
+        me = await app.get_me()
+        _bot_self_id = me.id
+    return _bot_self_id
 
 
 async def _client_for_chat(chat_id) -> Client:
@@ -534,20 +539,20 @@ async def _resolve_bot_ads_chat():
         log("WARN", "User đọc ads OK — bot chưa vào nhóm hoặc chưa cache peer")
         if user_ref.username:
             log("WARN", f"  Thử .env: ADS_CHAT=@{user_ref.username}")
-        log("WARN", "  Copy ads sẽ fallback qua user session")
+        log("WARN", "  Copy ra kênh vẫn qua user session (đọc ads OK)")
         return None
 
     return None
 
 
 async def mark_ads_chat_live(chat_id: int, title: str = ""):
-    """Bot nhận tin trong nhóm ads → cache peer, copy ads trực tiếp được."""
+    """Bot nhận tin trong nhóm ads → cache peer (tùy chọn, không dùng để copy kênh)."""
     global ads_chat_resolved, ads_bot_accessible
     if ads_bot_accessible and ads_chat_resolved == chat_id:
         return
     ads_chat_resolved  = chat_id
     ads_bot_accessible = True
-    log("ADS", f"✓ Bot live trong '{title or chat_id}' — copy ads qua bot OK")
+    log("ADS", f"✓ Bot live trong '{title or chat_id}' (peer cached)")
 
 
 async def resolve_ads_chat_for_bot() -> bool:
@@ -572,20 +577,15 @@ async def cmd_checkads(reply_chat_id: int):
         "━━━━━━━━━━━━━━━",
         f".env ADS_CHAT = {ADS_CHAT}",
         f"Resolved     = {get_ads_chat_id()}",
-        f"Bot copy ads = {'✅ bot' if ads_bot_accessible else '⚠️ user fallback'}",
+        "Gửi ra kênh  = 👤 user session (giữ emoji premium)",
+        f"Bot trong ads = {'✅' if ads_bot_accessible else '⚠️ không bắt buộc'}",
     ]
 
     if ads_bot_accessible:
         title = (getattr(chat, "title", None) if chat else None) or ads_chat_resolved
-        lines.append(f"✅ Bot OK: {title} (id={ads_chat_resolved})")
+        lines.append(f"✅ Bot live: {title} (id={ads_chat_resolved})")
     else:
-        lines.append("❌ Bot chưa copy ads trực tiếp được")
-        try:
-            me = await app.get_me()
-            await app.get_chat_member(get_ads_chat_id(), me.id)
-            lines.append("⚠️ Bot trong nhóm nhưng chưa cache peer — gửi 1 tin trong nhóm ads")
-        except Exception as e:
-            lines.append(f"❌ Bot chưa trong nhóm ads: {type(e).__name__}")
+        lines.append("ℹ️ Bot chưa cache peer nhóm ads (không ảnh hưởng copy — user đảm nhiệm)")
 
     uc = await ensure_user_client()
     if uc:
@@ -604,8 +604,8 @@ async def cmd_checkads(reply_chat_id: int):
 
     lines += [
         "━━━━━━━━━━━━━━━",
-        "ℹ️ Bot không hỗ trợ get_dialogs — chỉ test ADS_CHAT",
-        "💡 Add bot → gửi 1 tin trong nhóm ads → restart → /checkads",
+        "ℹ️ Đọc ads + copy ra kênh đều qua user session",
+        "ℹ️ Bot chỉ nhận bài DM + lệnh (emoji premium kênh cần user Premium)",
     ]
     await safe_send("\n".join(lines), reply_chat_id)
 
@@ -1042,16 +1042,13 @@ def record_failed(target_id, target_title, items):
 
 async def load_ads_into(slot):
     """
-    Đọc danh sách ads — LUÔN ưu tiên user session.
-    Bot chỉ thấy tin gửi SAU khi được add vào nhóm, không đọc được lịch sử cũ.
-    Copy ads ra kênh: bot nếu có trong nhóm, else user fallback.
+    Đọc danh sách ads — LUÔN qua user session (đủ lịch sử).
+    Copy ads ra kênh: user session (giữ emoji premium).
     """
     ads      = []
     chat_id  = slot.get("ads_chat_id") or get_ads_chat_id()
     last_err = None
-    bot_copy = ads_bot_accessible
     uc       = await ensure_user_client()
-    # User trước (đủ lịch sử), bot chỉ để fallback nếu không có user session
     order    = (("user", uc), ("bot", app)) if uc else (("bot", app),)
 
     for label, client in order:
@@ -1065,13 +1062,8 @@ async def load_ads_into(slot):
             ads.reverse()
             slot["ads_msgs"]     = ads
             slot["ads_chat_id"]  = chat_id
-            slot["ads_bot_copy"] = ads_bot_accessible
-            log("ADS", f"Load {len(ads)} ads qua {label}"
-                       + (f" | gửi ads: {'bot' if ads_bot_accessible else 'user copy_message'}"))
-            if label == "user" and bot_copy:
-                log("ADS", "Đọc ads qua user (đủ lịch sử) — copy qua bot")
-            elif not bot_copy:
-                log("WARN", "Bot chưa trong ADS_CHAT — copy ads qua user session")
+            slot["ads_bot_copy"] = False
+            log("ADS", f"Load {len(ads)} ads qua {label} | gửi ra kênh: user (emoji premium)")
             return
         except Exception as e:
             last_err = e
@@ -1174,24 +1166,24 @@ async def update_menu(n, chat_id: int):
 
 
 # ─────────────────────────────────────────────────────────
-# Copy core — CHỈ copy_message / copy_media_group (giữ emoji premium)
+# Copy core — user session copy ra kênh (giữ emoji premium)
+# Bot API chỉ giữ raw/emoji đầy đủ trong chat riêng, không ra kênh.
 # ─────────────────────────────────────────────────────────
 
 def _is_user_dm_chat(chat_id) -> bool:
     return isinstance(chat_id, int) and chat_id > 0
 
 
-async def _pick_copy_client(from_chat) -> Client:
-    """Content DM → chỉ bot. Ads → bot nếu live, else user."""
-    if _is_user_dm_chat(from_chat):
-        return app
-    if _is_ads_chat_id(from_chat):
-        if ads_bot_accessible:
-            return app
-        uc = await ensure_user_client()
-        if uc:
-            return uc
-    return app
+async def _copy_from_chat(client: Client, stored_from: int) -> int:
+    """
+    stored_from trong sequence = user_chat_id (DM, nhìn từ phía bot).
+    User session copy content cần from_chat = bot id (cùng msg_id trong 1-1).
+    """
+    if _is_user_dm_chat(stored_from):
+        if client is app:
+            return stored_from
+        return await get_bot_id()
+    return stored_from
 
 
 async def _import_peer(src_client: Client, dst_client: Client, chat_id) -> bool:
@@ -1256,44 +1248,41 @@ async def _warm_copy_peers(client: Client, target_id, from_chat) -> None:
     ch    = _lookup_channel(target_id)
     uname = (ch or {}).get("username") or ""
     await _warm_peer(client, target_id, uname or None)
-    await _warm_peer(client, from_chat)
+    src = await _copy_from_chat(client, from_chat)
+    await _warm_peer(client, src)
 
 
 async def _warm_channels_for_copy(channel_ids: list) -> None:
     await _resolve_bot_ads_chat()
+    uc = await ensure_user_client()
     for cid in channel_ids:
         ch    = _lookup_channel(cid)
         uname = (ch or {}).get("username") or ""
-        if not await _warm_peer(app, cid, uname or None):
-            log("WARN", f"warm peer ch={cid} — chưa chắc OK")
-    ads_id = get_ads_chat_id()
-    if ads_id and not ads_bot_accessible:
-        uc = await ensure_user_client()
         if uc:
-            await _import_peer(uc, app, ads_id)
+            await _warm_peer(uc, cid, uname or None)
+        await _warm_peer(app, cid, uname or None)
+    if uc:
+        await _warm_peer(uc, await get_bot_id())
+        ads_id = get_ads_chat_id()
+        if ads_id:
+            await _warm_peer(uc, ads_id)
 
 
 async def _warm_all_saved_channels() -> None:
     channels = load_channels()
     if not channels:
         return
-    log("START", f"Warm peer {len(channels)} kênh đã lưu...")
+    log("START", f"Warm peer {len(channels)} kênh (user copy)...")
     await _warm_channels_for_copy([ch["id"] for ch in channels])
 
 
 async def _clients_for_copy(from_chat) -> list:
-    if _is_user_dm_chat(from_chat):
-        return [app]
-    clients: list = []
-    if _is_ads_chat_id(from_chat):
-        if ads_bot_accessible:
-            clients.append(app)
-        uc = await ensure_user_client()
-        if uc and uc not in clients:
-            clients.append(uc)
-        return clients or [app]
-    c = await _pick_copy_client(from_chat)
-    return [c]
+    """Copy ra kênh: luôn ưu tiên user session (giữ emoji premium)."""
+    uc = await ensure_user_client()
+    if uc:
+        return [uc]
+    log("WARN", "Không có user session — fallback bot (emoji premium kênh có thể mất)")
+    return [app]
 
 
 async def _try_copy_one(target_id, from_chat, msg_id, is_album: bool,
@@ -1314,10 +1303,11 @@ async def _try_copy_one(target_id, from_chat, msg_id, is_album: bool,
             pass
 
     async def _do_copy(c: Client):
+        src = await _copy_from_chat(c, from_chat)
         if is_album:
-            copied = await c.copy_media_group(target_id, from_chat, msg_id)
+            copied = await c.copy_media_group(target_id, src, msg_id)
             return len(copied) if copied else n_items
-        await c.copy_message(target_id, from_chat, msg_id)
+        await c.copy_message(target_id, src, msg_id)
         return 1
 
     last_err = None
@@ -1344,8 +1334,9 @@ async def _try_copy_one(target_id, from_chat, msg_id, is_album: bool,
                 tag = "bot" if c is app else "user"
                 try:
                     n = await _do_copy(c)
-                    if _is_ads_chat_id(from_chat) and c is not app:
-                        log("COPY", f"  ads fallback ({tag}) src={from_chat}")
+                    if c is not app:
+                        kind = "content" if _is_user_dm_chat(from_chat) else "ads"
+                        log("COPY", f"  {kind} via user src={await _copy_from_chat(c, from_chat)}")
                     return n, None
                 except FloodWait as e:
                     wait = e.value + 3
@@ -1381,8 +1372,8 @@ async def _try_copy_one(target_id, from_chat, msg_id, is_album: bool,
 
 async def copy_sequence_to_channel(target_id, sequence):
     """
-    Copy sequence tới target_id — CHỈ copy_message / copy_media_group.
-    Content: luôn qua bot (DM). Ads: bot nếu live, else user copy_message.
+    Copy sequence tới target_id — user session copy_message (giữ emoji premium).
+    Content: user copy từ chat bot. Ads: user copy từ nhóm ads.
     """
     await _resolve_bot_ads_chat()
     ch    = _lookup_channel(target_id)
@@ -2677,7 +2668,7 @@ async def handler(client, msg: Message):
             "  3. Gõ tên kênh hoặc tap /lệnh → copy ra kênh\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📡 {n_ch} kênh đã lưu\n"
-            "✨ Emoji premium giữ nguyên (copy_message)!\n"
+            "✨ Emoji premium: user session copy ra kênh (cần Premium)!\n"
             "Gõ /help để xem đầy đủ lệnh.",
             chat_id,
         )
@@ -2697,8 +2688,8 @@ async def handler(client, msg: Message):
                 "📢 Khác: /all /next /skip\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 "⚙️ Yêu cầu:\n"
-                "  • Bot là admin các kênh đích (quyền đăng bài)\n"
-                "  • Bot trong nhóm ads để copy ads\n",
+                "  • User session admin các kênh đích (đăng bài + emoji premium)\n"
+                "  • Bot admin kênh (dự phòng) + trong nhóm ads (đọc tin mới)\n",
                 chat_id,
             )
         return
