@@ -1012,12 +1012,18 @@ def record_failed(target_id, target_title, items):
 # ─────────────────────────────────────────────────────────
 
 async def load_ads_into(slot):
+    """
+    Đọc danh sách ads — LUÔN ưu tiên user session.
+    Bot chỉ thấy tin gửi SAU khi được add vào nhóm, không đọc được lịch sử cũ.
+    Copy ads ra kênh: bot nếu có trong nhóm, else user fallback.
+    """
     ads      = []
     chat_id  = slot.get("ads_chat_id") or get_ads_chat_id()
     last_err = None
-    bot_ok   = await bot_has_ads_access()
-    order    = (("bot", app), ("user", await ensure_user_client())) if bot_ok else (
-               ("user", await ensure_user_client()), ("bot", app))
+    bot_copy = await bot_has_ads_access()
+    uc       = await ensure_user_client()
+    # User trước (đủ lịch sử), bot chỉ để fallback nếu không có user session
+    order    = (("user", uc), ("bot", app)) if uc else (("bot", app),)
 
     for label, client in order:
         if client is None:
@@ -1028,13 +1034,15 @@ async def load_ads_into(slot):
                 if not msg.empty and not msg.service:
                     ads.append(msg.id)
             ads.reverse()
-            slot["ads_msgs"]       = ads
-            slot["ads_chat_id"]    = chat_id
-            slot["ads_bot_copy"]   = bot_ok or label == "bot"
-            log("ADS", f"Load xong {len(ads)} ads qua {label}"
-                       + ("" if slot["ads_bot_copy"] else " (copy ads: user fallback)"))
-            if not slot["ads_bot_copy"]:
-                log("WARN", "Bot chưa trong ADS_CHAT — copy ads dùng user session khi gửi")
+            slot["ads_msgs"]     = ads
+            slot["ads_chat_id"]  = chat_id
+            slot["ads_bot_copy"] = bot_copy
+            log("ADS", f"Load {len(ads)} ads qua {label}"
+                       + (f" | copy ads: {'bot' if bot_copy else 'user'}"))
+            if label == "user" and bot_copy:
+                log("ADS", "Đọc ads qua user (đủ lịch sử) — copy qua bot")
+            elif not bot_copy:
+                log("WARN", "Bot chưa trong ADS_CHAT — copy ads qua user session")
             return
         except Exception as e:
             last_err = e
