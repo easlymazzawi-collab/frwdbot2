@@ -59,6 +59,7 @@ else:
 
 # ID thực sau khi resolve (có thể khác .env nếu cache/warm dialogs)
 ads_chat_resolved: int | str | None = None
+ads_bot_accessible: bool = False
 # Session userbot cũ (giống tool__tauto_nostage: Client("test_session", ...))
 USER_SESSION   = os.getenv("USER_SESSION", "test_session")
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
@@ -238,6 +239,7 @@ def reset_slot(slot):
     slot["_album_pending"]   = 0
     slot["total_media_count"] = 0
     slot["user_chat_id"]     = uid
+    slot.pop("ads_bot_copy", None)
     slot.pop("_topic_event", None)
 
 
@@ -304,8 +306,17 @@ def _resolve_user_session_name() -> str | None:
     return USER_SESSION if os.path.exists(_session_db_path(USER_SESSION)) else None
 
 
+async def _client_for_chat(chat_id) -> Client:
+    """Bot cho content DM; user fallback cho ADS_CHAT nếu bot chưa vào nhóm."""
+    if _is_ads_chat_id(chat_id) and not await bot_has_ads_access():
+        uc = await ensure_user_client()
+        if uc:
+            return uc
+    return app
+
+
 async def _reader_client() -> Client:
-    """Client đọc dữ liệu (folder, ads, topic) — ưu tiên user session."""
+    """Đọc metadata (topic) — ưu tiên user session."""
     uc = await ensure_user_client()
     return uc or app
 
@@ -420,6 +431,27 @@ def get_ads_chat_id() -> int | str:
     return ads_chat_resolved if ads_chat_resolved is not None else ADS_CHAT
 
 
+def _is_ads_chat_id(cid) -> bool:
+    if cid is None:
+        return False
+    known = {get_ads_chat_id()}
+    if isinstance(ADS_CHAT, int):
+        known.add(ADS_CHAT)
+    if isinstance(ads_chat_resolved, int):
+        known.add(ads_chat_resolved)
+    return cid in known
+
+
+async def bot_has_ads_access() -> bool:
+    if not ads_bot_accessible:
+        return False
+    try:
+        await app.get_chat(get_ads_chat_id())
+        return True
+    except Exception:
+        return False
+
+
 async def warm_bot_dialogs(limit: int = 500) -> int:
     n = 0
     try:
@@ -433,7 +465,8 @@ async def warm_bot_dialogs(limit: int = 500) -> int:
 
 async def resolve_ads_chat_for_bot() -> bool:
     """Tìm ADS_CHAT trong cache bot — fix Peer id invalid sau khi mới add bot."""
-    global ads_chat_resolved
+    global ads_chat_resolved, ads_bot_accessible
+    ads_bot_accessible = False
     target   = ADS_CHAT
     bot_seen = None
     user_ref = None
@@ -456,6 +489,7 @@ async def resolve_ads_chat_for_bot() -> bool:
 
     if bot_seen:
         ads_chat_resolved = bot_seen.id
+        ads_bot_accessible = True
         log("START", f"ADS_CHAT ✓ bot thấy '{bot_seen.title}' id={ads_chat_resolved}")
         return True
 
@@ -463,6 +497,7 @@ async def resolve_ads_chat_for_bot() -> bool:
         try:
             chat = await app.get_chat(attempt)
             ads_chat_resolved = chat.id
+            ads_bot_accessible = True
             log("START", f"ADS_CHAT ✓ get_chat '{chat.title}' id={ads_chat_resolved}")
             return True
         except Exception as e:
@@ -478,10 +513,13 @@ async def resolve_ads_chat_for_bot() -> bool:
             try:
                 chat = await app.get_chat(user_ref.id)
                 ads_chat_resolved = chat.id
+                ads_bot_accessible = True
                 log("START", f"ADS_CHAT ✓ (qua user id) '{chat.title}' id={ads_chat_resolved}")
                 return True
             except Exception as e:
                 log("WARN", f"bot vẫn không thấy id={user_ref.id}: {e}")
+                ads_chat_resolved = user_ref.id
+                log("WARN", "User đọc ads OK nhưng bot chưa trong nhóm — copy ads sẽ fallback user session")
         except Exception as e:
             log("WARN", f"user get_chat ads: {e}")
 
@@ -967,11 +1005,14 @@ def record_failed(target_id, target_title, items):
 # ─────────────────────────────────────────────────────────
 
 async def load_ads_into(slot):
-    ads     = []
-    chat_id = slot.get("ads_chat_id") or get_ads_chat_id()
+    ads      = []
+    chat_id  = slot.get("ads_chat_id") or get_ads_chat_id()
     last_err = None
+    bot_ok   = await bot_has_ads_access()
+    order    = (("bot", app), ("user", await ensure_user_client())) if bot_ok else (
+               ("user", await ensure_user_client()), ("bot", app))
 
-    for label, client in (("bot", app), ("user", await ensure_user_client())):
+    for label, client in order:
         if client is None:
             continue
         try:
@@ -980,9 +1021,13 @@ async def load_ads_into(slot):
                 if not msg.empty and not msg.service:
                     ads.append(msg.id)
             ads.reverse()
-            slot["ads_msgs"]    = ads
-            slot["ads_chat_id"] = chat_id
-            log("ADS", f"Load xong {len(ads)} ads qua {label}")
+            slot["ads_msgs"]       = ads
+            slot["ads_chat_id"]    = chat_id
+            slot["ads_bot_copy"]   = bot_ok or label == "bot"
+            log("ADS", f"Load xong {len(ads)} ads qua {label}"
+                       + ("" if slot["ads_bot_copy"] else " (copy ads: user fallback)"))
+            if not slot["ads_bot_copy"]:
+                log("WARN", "Bot chưa trong ADS_CHAT — copy ads dùng user session khi gửi")
             return
         except Exception as e:
             last_err = e
@@ -999,8 +1044,8 @@ async def load_ads(chat_id: int):
 # Menu
 # ─────────────────────────────────────────────────────────
 
-def get_menu(n_content):
-    slot      = active_slot()
+def get_menu(n_content, chat_id: int | None = None):
+    slot      = active_slot(chat_id) if chat_id else active_slot()
     ads_count = max(1, len(slot["ads_msgs"]))
     best      = max(1, round(n_content / ads_count))
     media_cnt = slot.get("total_media_count", 0)
@@ -1067,7 +1112,7 @@ async def update_menu(n, chat_id: int):
         await build_sequence(best, chat_id=chat_id)
         return
 
-    text = get_menu(n)
+    text = get_menu(n, chat_id)
     if slot.get("menu_msg_id"):
         ok = await robust_edit(chat_id, slot["menu_msg_id"], text)
         if ok:
@@ -1091,10 +1136,20 @@ async def update_menu(n, chat_id: int):
 async def _try_copy_one(target_id, from_chat, msg_id, is_album: bool,
                         bucket: TokenBucket, last_ts: list):
     if is_album:
-        album = await app.get_media_group(from_chat, msg_id)
-        n_items = len(album) if album else 1
+        try:
+            album = await app.get_media_group(from_chat, msg_id)
+            n_items = len(album) if album else 1
+        except Exception:
+            n_items = 1
     else:
         n_items = 1
+
+    async def _do_copy(client: Client):
+        if is_album:
+            copied = await client.copy_media_group(target_id, from_chat, msg_id)
+            return len(copied) if copied else n_items
+        await client.copy_message(target_id, from_chat, msg_id)
+        return 1
 
     while True:
         elapsed = time.monotonic() - last_ts[0]
@@ -1113,11 +1168,8 @@ async def _try_copy_one(target_id, from_chat, msg_id, is_album: bool,
             await asyncio.sleep(remain)
 
         try:
-            if is_album:
-                copied = await app.copy_media_group(target_id, from_chat, msg_id)
-                return len(copied) if copied else n_items, None
-            await app.copy_message(target_id, from_chat, msg_id)
-            return 1, None
+            n = await _do_copy(app)
+            return n, None
 
         except FloodWait as e:
             wait = e.value + 3
@@ -1135,6 +1187,15 @@ async def _try_copy_one(target_id, from_chat, msg_id, is_album: bool,
             return 0, f"SKIP:{type(e).__name__}"
 
         except Exception as e:
+            if _is_ads_chat_id(from_chat):
+                uc = await ensure_user_client()
+                if uc:
+                    try:
+                        n = await _do_copy(uc)
+                        log("COPY", f"  ads fallback user session src={from_chat}")
+                        return n, None
+                    except Exception as e2:
+                        log("ERROR", f"copy ads user fallback: {type(e2).__name__}: {e2}")
             log("ERROR", f"copy {from_chat}/{msg_id} fail: {type(e).__name__}: {str(e)[:100]}")
             return 0, None
 
@@ -1155,6 +1216,7 @@ async def copy_sequence_to_channel(target_id, sequence):
 
     for seq_item in sequence:
         src_chat, msg_id = seq_item
+        reader   = await _client_for_chat(src_chat)
         last_err   = None
         item_done  = False
 
@@ -1166,7 +1228,7 @@ async def copy_sequence_to_channel(target_id, sequence):
                 await asyncio.sleep(remain)
 
             try:
-                msg = await app.get_messages(src_chat, msg_id)
+                msg = await reader.get_messages(src_chat, msg_id)
 
                 if msg.empty:
                     if attempt < FWD_MAX_RETRY - 1:
@@ -1184,7 +1246,7 @@ async def copy_sequence_to_channel(target_id, sequence):
                         item_done = True
                         break
                     seen_groups.add(key)
-                    album = await app.get_media_group(src_chat, msg_id)
+                    album = await reader.get_media_group(src_chat, msg_id)
                     if album:
                         expanded.append((src_chat, album[0].id, True, seq_item, len(album)))
                     item_done = True
@@ -2317,8 +2379,8 @@ async def handler(client, msg: Message):
         if not slot["waiting"]:
             return
 
-        if msg.forward_from_chat and msg.forward_from_chat.id == get_ads_chat_id():
-            slot["ads_chat_id"] = get_ads_chat_id()
+        if msg.forward_from_chat and _is_ads_chat_id(msg.forward_from_chat.id):
+            slot["ads_chat_id"] = msg.forward_from_chat.id
             await load_ads_into(slot)
             return
 
@@ -2662,7 +2724,7 @@ async def handler(client, msg: Message):
 # ─────────────────────────────────────────────────────────
 
 async def main():
-    global _global_bucket, ALLOWED_USER_IDS, ads_chat_resolved
+    global _global_bucket, ALLOWED_USER_IDS, ads_chat_resolved, ads_bot_accessible
     _global_bucket = TokenBucket(FWD_GLOBAL_RATE, FWD_GLOBAL_BURST)
 
     if not BOT_TOKEN:
