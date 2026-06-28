@@ -41,9 +41,39 @@ python tool_tauto_bot.py
 
 ```
 /add /addf /list /del /alias /check /clean
+/botadd /botaddf          ← auto mời bot + cấp admin kênh
 /map /mapgen /xepbai /xepbaiwhite
 /all /next /skip /help
 /done1 ~ /done10 /xdone /zdone
+```
+
+### Auto add bot vào kênh folder
+
+Bot **không thể tự join** kênh — cần tài khoản user (admin kênh) mời bot:
+
+1. Cấu hình `SESSION_STRING` hoặc file `user_session.session` trong `.env`
+2. Tài khoản user phải là **admin** các kênh trong folder (quyền thêm member + cấp admin)
+3. Chạy:
+
+```
+/botaddf https://t.me/addlist/xxxxx
+```
+
+→ Đọc folder, lưu kênh vào `channels.json`, mời bot vào từng kênh, cấp quyền đăng bài.
+
+```
+/botadd          → tất cả kênh trong channels.json
+/botadd 1 3 5    → kênh theo số thứ tự (/list)
+/botadd 1-20     → dải kênh
+```
+
+Tạo session string (chạy 1 lần trên máy local):
+
+```python
+from pyrogram import Client
+app = Client("user_session", api_id=API_ID, api_hash=API_HASH)
+app.run()
+# Sau khi login: print(await app.export_session_string())
 ```
 
 ## File dữ liệu

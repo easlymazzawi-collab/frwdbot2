@@ -16,6 +16,7 @@ Luồng:
   4. Auto reset, sẵn sàng batch tiếp
 
 Lệnh: /add /addf /list /del /alias /check /clean
+      /botadd /botaddf — auto mời bot + cấp admin (cần user session)
       /map /mapgen /xepbai /xepbaiwhite /all /next /skip /help
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -30,7 +31,8 @@ import time
 import traceback
 from dotenv import load_dotenv
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.enums import ChatMemberStatus
+from pyrogram.types import Message, ChatPrivileges
 from pyrogram.errors import (
     FloodWait,
     ChannelInvalid,
@@ -39,6 +41,7 @@ from pyrogram.errors import (
     PeerIdInvalid,
     UserBannedInChannel,
     ChatAdminRequired,
+    UserAlreadyParticipant,
 )
 
 load_dotenv()
@@ -51,6 +54,9 @@ _allowed_raw = os.getenv("ALLOWED_USER_IDS") or os.getenv("ALLOWED_USER_ID") or 
 ALLOWED_USER_IDS = {int(x.strip()) for x in _allowed_raw.split(",") if x.strip()}
 
 ADS_CHAT       = int(os.getenv("ADS_CHAT"))
+USER_SESSION   = os.getenv("USER_SESSION", "user_session")
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+
 CHANNELS_FILE  = "channels.json"
 FOLDERS_FILE   = "folders.json"
 FAILED_FILE    = "failed_msgs.json"
@@ -115,6 +121,8 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
 )
+
+user_app: "Client | None" = None
 
 fwd_lock             = asyncio.Lock()
 _channels_write_lock = asyncio.Lock()
@@ -605,6 +613,7 @@ def pick_next_rr(topic_title: str, cmds: list) -> str:
 
 RESERVED_CMDS = {
     "add", "addf", "addchan", "addfolder",
+    "botadd", "botaddf", "addbot", "addbotf",
     "list", "listchan",
     "del", "delchan",
     "alias", "aliaschan",
@@ -1336,6 +1345,316 @@ async def _fetch_folder_chats(slug):
     return getattr(result, "title", slug) or slug, getattr(result, "chats", [])
 
 
+def _raw_chat_to_channel(chat):
+    title    = getattr(chat, "title", "") or ""
+    username = getattr(chat, "username", "") or ""
+    raw_id   = getattr(chat, "id", None)
+    if not raw_id or not title:
+        return None
+    tg_id = int(f"-100{raw_id}") if raw_id > 0 else raw_id
+    return {"id": tg_id, "title": title, "username": username, "alias": ""}
+
+
+def _channels_from_folder_chats(chats):
+    out = []
+    for chat in chats:
+        ch = _raw_chat_to_channel(chat)
+        if ch:
+            out.append(ch)
+    return out
+
+
+def _parse_channel_indices(arg: str, total: int) -> list[int]:
+    if not arg.strip():
+        return list(range(total))
+    indices: set[int] = set()
+    for part in arg.replace(",", " ").split():
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            left, right = part.split("-", 1)
+            try:
+                start = int(left)
+                end   = int(right)
+            except ValueError:
+                continue
+            if start > end:
+                start, end = end, start
+            for i in range(start, end + 1):
+                indices.add(i - 1)
+        else:
+            try:
+                indices.add(int(part) - 1)
+            except ValueError:
+                continue
+    return sorted(i for i in indices if 0 <= i < total)
+
+
+# ─────────────────────────────────────────────────────────
+# User session — mời bot vào kênh + cấp admin (bot không tự add được)
+# ─────────────────────────────────────────────────────────
+
+BOT_POST_PRIVILEGES = ChatPrivileges(
+    can_manage_chat=True,
+    can_post_messages=True,
+    can_edit_messages=True,
+    can_delete_messages=True,
+    can_invite_users=False,
+    can_promote_members=False,
+    can_change_info=False,
+    can_pin_messages=False,
+    can_manage_video_chats=False,
+    can_restrict_members=False,
+    can_manage_topics=False,
+    is_anonymous=False,
+)
+
+
+async def ensure_user_client() -> "Client | None":
+    global user_app
+    if user_app is not None and user_app.is_connected:
+        return user_app
+    try:
+        if SESSION_STRING:
+            user_app = Client(
+                "user_helper",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                session_string=SESSION_STRING,
+            )
+        elif os.path.exists(f"{USER_SESSION}.session"):
+            user_app = Client(USER_SESSION, api_id=API_ID, api_hash=API_HASH)
+        else:
+            return None
+        await user_app.start()
+        me = await user_app.get_me()
+        log("USER", f"User session ✓ id={me.id}")
+        return user_app
+    except Exception as e:
+        log("ERROR", f"ensure_user_client: {type(e).__name__}: {e}")
+        user_app = None
+        return None
+
+
+def _bot_member_ok(member) -> bool:
+    if not member:
+        return False
+    status = member.status
+    if status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+        return False
+    if status == ChatMemberStatus.ADMINISTRATOR:
+        priv = member.privileges
+        if priv and getattr(priv, "can_post_messages", None) is False:
+            return False
+        return True
+    if status == ChatMemberStatus.OWNER:
+        return True
+    return False
+
+
+async def _invite_bot_to_channel(uc: Client, ch_id, bot_target) -> str | None:
+    try:
+        await uc.add_chat_members(ch_id, bot_target)
+        return None
+    except UserAlreadyParticipant:
+        return None
+    except FloodWait as e:
+        await asyncio.sleep(e.value + 2)
+        try:
+            await uc.add_chat_members(ch_id, bot_target)
+            return None
+        except UserAlreadyParticipant:
+            return None
+        except Exception as e2:
+            return f"mời bot: {type(e2).__name__}: {str(e2)[:80]}"
+    except Exception as e:
+        return f"mời bot: {type(e).__name__}: {str(e)[:80]}"
+
+
+async def _promote_bot_in_channel(uc: Client, ch_id, bot_id) -> str | None:
+    try:
+        await uc.promote_chat_member(ch_id, bot_id, privileges=BOT_POST_PRIVILEGES)
+        return None
+    except FloodWait as e:
+        await asyncio.sleep(e.value + 2)
+        try:
+            await uc.promote_chat_member(ch_id, bot_id, privileges=BOT_POST_PRIVILEGES)
+            return None
+        except Exception as e2:
+            return f"cấp admin: {type(e2).__name__}: {str(e2)[:80]}"
+    except Exception as e:
+        return f"cấp admin: {type(e).__name__}: {str(e)[:80]}"
+
+
+async def cmd_botadd_channels(
+    channel_list: list,
+    reply_chat_id: int,
+    *,
+    merge_into_json: bool = False,
+    title_prefix: str = "",
+):
+    if not channel_list:
+        await safe_send("⚠️ Không có kênh nào để xử lý.", reply_chat_id)
+        return
+
+    uc = await ensure_user_client()
+    if not uc:
+        await safe_send(
+            "❌ Cần **user session** để thêm bot vào kênh.\n"
+            "━━━━━━━━━━━━━━━\n"
+            "Bot không thể tự join kênh — tài khoản user (admin kênh) mời bot.\n\n"
+            "Cấu hình 1 trong 2:\n"
+            f"  • File `{USER_SESSION}.session` (login Pyrogram 1 lần)\n"
+            "  • `SESSION_STRING` trong .env\n\n"
+            "User phải là admin kênh với quyền:\n"
+            "  thêm member + cấp admin (đăng bài).",
+            reply_chat_id,
+        )
+        return
+
+    me_bot     = await app.get_me()
+    bot_id     = me_bot.id
+    bot_target = me_bot.username or bot_id
+
+    ok, already, failed = [], [], []
+    status_msg = await robust_send(
+        f"🤖 {title_prefix}Đang add @{me_bot.username or bot_id} vào {len(channel_list)} kênh... (0/{len(channel_list)})",
+        reply_chat_id,
+    )
+
+    if merge_into_json:
+        stored = load_channels()
+    else:
+        stored = None
+
+    for i, ch in enumerate(channel_list):
+        ch_id = ch["id"]
+        title = ch.get("title") or str(ch_id)
+
+        try:
+            member = await app.get_chat_member(ch_id, bot_id)
+            if _bot_member_ok(member):
+                already.append(title)
+                if merge_into_json and stored is not None:
+                    if not any(str(c["id"]) == str(ch_id) for c in stored):
+                        stored.append(ch)
+                continue
+        except Exception:
+            pass
+
+        err = await _invite_bot_to_channel(uc, ch_id, bot_target)
+        if err:
+            failed.append((title, err))
+            await asyncio.sleep(0.4)
+            continue
+
+        err = await _promote_bot_in_channel(uc, ch_id, bot_id)
+        if err:
+            failed.append((title, err))
+            await asyncio.sleep(0.4)
+            continue
+
+        try:
+            member = await app.get_chat_member(ch_id, bot_id)
+            if _bot_member_ok(member):
+                ok.append(title)
+                if merge_into_json and stored is not None:
+                    if not any(str(c["id"]) == str(ch_id) for c in stored):
+                        stored.append(ch)
+            else:
+                failed.append((title, "bot chưa có quyền đăng bài sau promote"))
+        except Exception as e:
+            ok.append(title)
+            if merge_into_json and stored is not None:
+                if not any(str(c["id"]) == str(ch_id) for c in stored):
+                    stored.append(ch)
+            log("WARN", f"verify {title}: {e}")
+
+        await asyncio.sleep(0.5)
+
+        if status_msg and ((i + 1) % 3 == 0 or i == len(channel_list) - 1):
+            await robust_edit(
+                reply_chat_id,
+                status_msg.id,
+                f"🤖 {title_prefix}Add bot... ({i+1}/{len(channel_list)})\n"
+                f"✅ mới {len(ok)} | ✓ sẵn {len(already)} | ❌ {len(failed)}",
+            )
+
+    if merge_into_json and stored is not None:
+        save_channels(stored)
+
+    lines = [
+        f"🤖 {title_prefix}Kết quả add bot ({len(channel_list)} kênh):",
+        "━━━━━━━━━━━━━━━",
+        f"✅ Mới add + admin: {len(ok)}",
+        f"✓ Đã có sẵn: {len(already)}",
+        f"❌ Lỗi: {len(failed)}",
+    ]
+    if ok:
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.extend(f"  ✅ {t}" for t in ok[:20])
+        if len(ok) > 20:
+            lines.append(f"  ... +{len(ok) - 20} kênh")
+    if failed:
+        lines.append("━━━━━━━━━━━━━━━")
+        for t, err in failed[:15]:
+            lines.append(f"  ❌ {t}")
+            lines.append(f"     └ {err}")
+        if len(failed) > 15:
+            lines.append(f"  ... +{len(failed) - 15} lỗi")
+    if merge_into_json:
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append("📋 Kênh OK đã merge vào channels.json")
+
+    final = "\n".join(lines)
+    if status_msg:
+        if not await robust_edit(reply_chat_id, status_msg.id, final):
+            await robust_send(final, reply_chat_id)
+    else:
+        await robust_send(final, reply_chat_id)
+
+
+async def cmd_botadd(reply_chat_id: int, indices_arg: str = ""):
+    channels = load_channels()
+    if not channels:
+        await safe_send("📭 Chưa có kênh. Dùng /addf hoặc /botaddf trước.", reply_chat_id)
+        return
+    idxs = _parse_channel_indices(indices_arg, len(channels))
+    if not idxs:
+        await safe_send("❌ Chỉ số kênh không hợp lệ. VD: /botadd 1 3  hoặc /botadd 1-10", reply_chat_id)
+        return
+    targets = [channels[i] for i in idxs]
+    await cmd_botadd_channels(targets, reply_chat_id)
+
+
+async def cmd_botaddfolder(link: str, reply_chat_id: int):
+    import re as _re
+    match = _re.search(r"addlist/([A-Za-z0-9_+=-]+)", link.strip())
+    if not match:
+        await safe_send("❌ Link folder không hợp lệ.\nĐịnh dạng: https://t.me/addlist/xxxxx", reply_chat_id)
+        return
+    slug = match.group(1)
+    await safe_send("⏳ Đang đọc folder + add bot...", reply_chat_id)
+    try:
+        folder_title, chats = await _fetch_folder_chats(slug)
+    except Exception as e:
+        await safe_send(f"❌ Không đọc được folder: {e}", reply_chat_id)
+        return
+    channel_list = _channels_from_folder_chats(chats)
+    if not channel_list:
+        await safe_send("⚠️ Folder trống hoặc không có kênh.", reply_chat_id)
+        remember_folder(slug, folder_title)
+        return
+    remember_folder(slug, folder_title)
+    await cmd_botadd_channels(
+        channel_list,
+        reply_chat_id,
+        merge_into_json=True,
+        title_prefix=f"[{folder_title}] ",
+    )
+
+
 async def cmd_addfolder(link: str, reply_chat_id: int, silent: bool = False, remember: bool = True):
     import re as _re
     match = _re.search(r"addlist/([A-Za-z0-9_+=-]+)", link.strip())
@@ -1361,18 +1680,16 @@ async def cmd_addfolder(link: str, reply_chat_id: int, silent: bool = False, rem
         return 0
     channels       = load_channels()
     added, skipped = [], []
-    for chat in chats:
-        title    = getattr(chat, "title", "") or ""
-        username = getattr(chat, "username", "") or ""
-        raw_id   = getattr(chat, "id", None)
-        if not raw_id or not title:
-            continue
-        tg_id = int(f"-100{raw_id}") if raw_id > 0 else raw_id
-        if any(str(ch["id"]) == str(tg_id) for ch in channels):
+    for ch in _channels_from_folder_chats(chats):
+        title = ch["title"]
+        if any(str(c["id"]) == str(ch["id"]) for c in channels):
             skipped.append(title)
             continue
-        channels.append({"id": tg_id, "title": title, "username": username, "alias": ""})
-        added.append(f"✅ #{len(channels)}. {title}" + (f" (@{username})" if username else ""))
+        channels.append(ch)
+        added.append(
+            f"✅ #{len(channels)}. {title}"
+            + (f" (@{ch['username']})" if ch.get("username") else "")
+        )
     save_channels(channels)
     if remember:
         remember_folder(slug, folder_title)
@@ -1610,6 +1927,8 @@ async def task_auto_clean_dead():
 COMMAND_ALIASES = {
     "/addchan":   "/add",
     "/addfolder": "/addf",
+    "/addbot":    "/botadd",
+    "/addbotf":   "/botaddf",
     "/listchan":  "/list",
     "/delchan":   "/del",
     "/aliaschan": "/alias",
@@ -1750,6 +2069,9 @@ async def handler(client, msg: Message):
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 "📡 Quản lý kênh:\n"
                 "  /add /addf /list /del /alias /check /clean\n"
+                "  /botadd /botaddf — auto mời bot + cấp admin\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🤖 /botadd cần user session (SESSION_STRING hoặc .session)\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 "🗺️ Auto topic: /mapgen /map\n"
                 "⚙️ Xếp bài: /xepbai /xepbaiwhite\n"
@@ -1837,6 +2159,23 @@ async def handler(client, msg: Message):
             await safe_send("❌ Dùng: /addf https://t.me/addlist/xxxxx", chat_id)
             return
         await cmd_addfolder(lnk, chat_id)
+        return
+
+    if text == "/botadd" or text.startswith("/botadd "):
+        arg = text[7:].strip() if text.startswith("/botadd ") else ""
+        await cmd_botadd(chat_id, arg)
+        return
+
+    if text.startswith("/botaddf"):
+        lnk = text[8:].strip()
+        if not lnk:
+            await safe_send(
+                "❌ Dùng: /botaddf https://t.me/addlist/xxxxx\n"
+                "→ Đọc folder, lưu kênh + mời bot vào + cấp admin đăng bài.",
+                chat_id,
+            )
+            return
+        await cmd_botaddfolder(lnk, chat_id)
         return
 
     if text == "/list":
@@ -1998,6 +2337,15 @@ async def main():
         log("START", "Resolved ADS_CHAT ✓")
     except Exception as e:
         log("WARN", f"ADS_CHAT chưa accessible: {e} — thêm bot vào nhóm ads!")
+
+    if SESSION_STRING or os.path.exists(f"{USER_SESSION}.session"):
+        uc = await ensure_user_client()
+        if uc:
+            log("START", "User session ✓ — /botadd /botaddf khả dụng")
+        else:
+            log("WARN", "User session file/string có nhưng không start được")
+    else:
+        log("WARN", "Chưa có user session — /botadd /botaddf sẽ báo hướng dẫn setup")
 
     asyncio.ensure_future(task_auto_sync_folders())
     asyncio.ensure_future(task_auto_clean_dead())
