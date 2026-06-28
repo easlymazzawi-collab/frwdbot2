@@ -443,123 +443,127 @@ def _is_ads_chat_id(cid) -> bool:
 
 
 async def bot_has_ads_access() -> bool:
-    if not ads_bot_accessible:
-        return False
-    try:
-        await app.get_chat(get_ads_chat_id())
-        return True
-    except Exception:
-        return False
+    return ads_bot_accessible
 
 
-async def warm_bot_dialogs(limit: int = 500) -> int:
-    n = 0
-    try:
-        async for _ in app.get_dialogs(limit=limit):
-            n += 1
-        log("START", f"Cache {n} bot dialogs")
-    except Exception as e:
-        log("WARN", f"warm_bot_dialogs: {e}")
-    return n
-
-
-async def resolve_ads_chat_for_bot() -> bool:
-    """Tìm ADS_CHAT trong cache bot — fix Peer id invalid sau khi mới add bot."""
+async def _resolve_bot_ads_chat():
+    """
+    Bot KHÔNG dùng được get_dialogs (BOT_METHOD_INVALID).
+    Thử: get_chat(id/@username) → get_chat_member(bot) → user session ref.
+    """
     global ads_chat_resolved, ads_bot_accessible
     ads_bot_accessible = False
+
     target   = ADS_CHAT
-    bot_seen = None
     user_ref = None
+    uc       = await ensure_user_client()
 
-    await warm_bot_dialogs()
-
-    def _match(chat) -> bool:
-        if isinstance(target, str):
-            uname = (chat.username or "").lower()
-            return uname and target.lower().lstrip("@") == uname
-        return chat.id == target
-
-    try:
-        async for d in app.get_dialogs(limit=500):
-            if _match(d.chat):
-                bot_seen = d.chat
-                break
-    except Exception as e:
-        log("WARN", f"scan dialogs: {e}")
-
-    if bot_seen:
-        ads_chat_resolved = bot_seen.id
-        ads_bot_accessible = True
-        log("START", f"ADS_CHAT ✓ bot thấy '{bot_seen.title}' id={ads_chat_resolved}")
-        return True
-
-    for attempt in (target,):
-        try:
-            chat = await app.get_chat(attempt)
-            ads_chat_resolved = chat.id
-            ads_bot_accessible = True
-            log("START", f"ADS_CHAT ✓ get_chat '{chat.title}' id={ads_chat_resolved}")
-            return True
-        except Exception as e:
-            log("WARN", f"bot get_chat({attempt}): {type(e).__name__}: {e}")
-
-    uc = await ensure_user_client()
     if uc:
         try:
             user_ref = await uc.get_chat(target)
             log("CONFIG", f"User session thấy ads: '{user_ref.title}' id={user_ref.id}")
-            if isinstance(target, int) and user_ref.id != target:
-                log("WARN", f".env ADS_CHAT={target} nhưng user thấy id={user_ref.id} — thử id đúng")
-            try:
-                chat = await app.get_chat(user_ref.id)
-                ads_chat_resolved = chat.id
-                ads_bot_accessible = True
-                log("START", f"ADS_CHAT ✓ (qua user id) '{chat.title}' id={ads_chat_resolved}")
-                return True
-            except Exception as e:
-                log("WARN", f"bot vẫn không thấy id={user_ref.id}: {e}")
-                ads_chat_resolved = user_ref.id
-                log("WARN", "User đọc ads OK nhưng bot chưa trong nhóm — copy ads sẽ fallback user session")
         except Exception as e:
             log("WARN", f"user get_chat ads: {e}")
 
+    candidates: list = []
+    if isinstance(target, str):
+        candidates.append(target)
+    else:
+        candidates.append(target)
+    if user_ref:
+        if user_ref.username:
+            candidates.insert(0, user_ref.username)
+        if user_ref.id not in candidates:
+            candidates.append(user_ref.id)
+
+    seen, unique = set(), []
+    for c in candidates:
+        key = str(c).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+
+    for c in unique:
+        try:
+            chat = await app.get_chat(c)
+            ads_chat_resolved  = chat.id
+            ads_bot_accessible = True
+            log("START", f"ADS_CHAT ✓ bot '{chat.title}' id={ads_chat_resolved}")
+            return chat
+        except Exception as e:
+            log("WARN", f"bot get_chat({c}): {type(e).__name__}: {e}")
+
+    me = await app.get_me()
+    for c in unique:
+        try:
+            member = await app.get_chat_member(c, me.id)
+            if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+                log("WARN", f"bot là member nhưng status={member.status} trong {c}")
+                continue
+            cid = getattr(getattr(member, "chat", None), "id", None) or (
+                user_ref.id if user_ref else c
+            )
+            ads_chat_resolved  = cid
+            ads_bot_accessible = True
+            try:
+                chat = await app.get_chat(cid)
+                log("START", f"ADS_CHAT ✓ bot member '{chat.title}' id={cid}")
+                return chat
+            except Exception:
+                log("START", f"ADS_CHAT ✓ bot member id={cid} (get_chat cache sau)")
+                return user_ref
+        except Exception as e:
+            log("WARN", f"bot get_chat_member({c}): {type(e).__name__}: {e}")
+
+    if user_ref:
+        ads_chat_resolved  = user_ref.id
+        ads_bot_accessible = False
+        log("WARN", "User đọc ads OK — bot chưa vào nhóm hoặc chưa cache peer")
+        if user_ref.username:
+            log("WARN", f"  Thử .env: ADS_CHAT=@{user_ref.username}")
+        log("WARN", "  Copy ads sẽ fallback qua user session")
+        return None
+
+    return None
+
+
+async def resolve_ads_chat_for_bot() -> bool:
+    chat = await _resolve_bot_ads_chat()
+    if chat and ads_bot_accessible:
+        return True
+    if ads_chat_resolved and not ads_bot_accessible:
+        return False
     me = await app.get_me()
     log("WARN", "Bot chưa resolve được ADS_CHAT")
-    log("WARN", f"  .env ADS_CHAT = {target}")
-    if user_ref:
-        log("WARN", f"  User thấy id = {user_ref.id} — sửa .env ADS_CHAT={user_ref.id}")
-    log("WARN", f"  Đảm bảo @{me.username} đã trong nhóm ads, rồi **restart bot**")
-    log("WARN", "  Hoặc gửi /checkads trong bot để chẩn đoán")
+    log("WARN", f"  .env ADS_CHAT = {ADS_CHAT}")
+    log("WARN", f"  Thêm @{me.username} vào nhóm ads → gửi 1 tin trong nhóm → restart")
+    log("WARN", "  Hoặc dùng ADS_CHAT=@username thay vì id số")
     return False
 
 
 async def cmd_checkads(reply_chat_id: int):
+    global ads_chat_resolved, ads_bot_accessible
+
     lines = [
         "🔍 Chẩn đoán ADS_CHAT",
         "━━━━━━━━━━━━━━━",
         f".env ADS_CHAT = {ADS_CHAT}",
         f"Resolved     = {get_ads_chat_id()}",
+        f"Bot copy ads = {'✅' if ads_bot_accessible else '⚠️ user fallback'}",
     ]
-    await warm_bot_dialogs(100)
-    try:
-        chat = await app.get_chat(get_ads_chat_id())
-        lines.append(f"✅ Bot get_chat OK: {chat.title} (id={chat.id})")
-    except Exception as e:
-        lines.append(f"❌ Bot get_chat FAIL: {type(e).__name__}: {e}")
 
-    groups = []
-    try:
-        async for d in app.get_dialogs(limit=80):
-            c = d.chat
-            if c.type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
-                groups.append(f"  • {c.title}  id={c.id}" + (f" @{c.username}" if c.username else ""))
-    except Exception as e:
-        lines.append(f"❌ get_dialogs: {e}")
-
-    if groups:
-        lines += ["━━━━━━━━━━━━━━━", "📋 Bot đang ở (một phần):"] + groups[:15]
-        if len(groups) > 15:
-            lines.append(f"  ... +{len(groups)-15} chat")
+    chat = await _resolve_bot_ads_chat()
+    if chat and ads_bot_accessible:
+        title = getattr(chat, "title", None) or ads_chat_resolved
+        lines.append(f"✅ Bot OK: {title} (id={ads_chat_resolved})")
+    else:
+        lines.append("❌ Bot chưa copy ads trực tiếp được")
+        try:
+            me = await app.get_me()
+            await app.get_chat_member(get_ads_chat_id(), me.id)
+            lines.append("⚠️ Bot có trong nhóm nhưng chưa cache peer — restart hoặc ADS_CHAT=@username")
+        except Exception as e:
+            lines.append(f"❌ Bot chưa trong nhóm ads: {type(e).__name__}")
 
     uc = await ensure_user_client()
     if uc:
@@ -567,8 +571,10 @@ async def cmd_checkads(reply_chat_id: int):
             uch = await uc.get_chat(ADS_CHAT)
             lines += [
                 "━━━━━━━━━━━━━━━",
-                f"👤 User thấy ads: {uch.title} id={uch.id}",
+                f"👤 User thấy: {uch.title} id={uch.id}",
             ]
+            if uch.username:
+                lines.append(f"💡 Thử .env: ADS_CHAT=@{uch.username}")
             if isinstance(ADS_CHAT, int) and uch.id != ADS_CHAT:
                 lines.append(f"⚠️ Sửa .env: ADS_CHAT={uch.id}")
         except Exception as e:
@@ -576,7 +582,8 @@ async def cmd_checkads(reply_chat_id: int):
 
     lines += [
         "━━━━━━━━━━━━━━━",
-        "💡 Add bot vào nhóm ads → **restart bot** → /checkads lại",
+        "ℹ️ Bot không hỗ trợ get_dialogs — chỉ test ADS_CHAT",
+        "💡 Add bot → gửi 1 tin trong nhóm ads → restart → /checkads",
     ]
     await safe_send("\n".join(lines), reply_chat_id)
 
