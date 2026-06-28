@@ -23,6 +23,7 @@ Lệnh: /add /addf /list /del /alias /check /clean
 
 import asyncio
 import copy
+import inspect
 import os
 import json
 import random
@@ -1395,20 +1396,27 @@ def _parse_channel_indices(arg: str, total: int) -> list[int]:
 # User session — mời bot vào kênh + cấp admin (bot không tự add được)
 # ─────────────────────────────────────────────────────────
 
-BOT_POST_PRIVILEGES = ChatPrivileges(
-    can_manage_chat=True,
-    can_post_messages=True,
-    can_edit_messages=True,
-    can_delete_messages=True,
-    can_invite_users=False,
-    can_promote_members=False,
-    can_change_info=False,
-    can_pin_messages=False,
-    can_manage_video_chats=False,
-    can_restrict_members=False,
-    can_manage_topics=False,
-    is_anonymous=False,
-)
+def _make_bot_post_privileges() -> ChatPrivileges:
+    """Tạo ChatPrivileges tương thích mọi phiên bản Pyrogram."""
+    desired = {
+        "can_manage_chat": True,
+        "can_post_messages": True,
+        "can_edit_messages": True,
+        "can_delete_messages": True,
+        "can_invite_users": False,
+        "can_promote_members": False,
+        "can_change_info": False,
+        "can_pin_messages": False,
+        "can_manage_video_chats": False,
+        "can_restrict_members": False,
+        "can_manage_topics": False,
+        "is_anonymous": False,
+    }
+    supported = set(inspect.signature(ChatPrivileges.__init__).parameters) - {"self"}
+    return ChatPrivileges(**{k: v for k, v in desired.items() if k in supported})
+
+
+BOT_POST_PRIVILEGES = _make_bot_post_privileges()
 
 
 async def ensure_user_client() -> "Client | None":
