@@ -32,7 +32,7 @@ import time
 import traceback
 from dotenv import load_dotenv
 from pyrogram import Client, filters
-from pyrogram.enums import ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.types import Message, ChatPrivileges
 from pyrogram.errors import (
     FloodWait,
@@ -1589,6 +1589,73 @@ def _bot_member_ok(member) -> bool:
     return False
 
 
+async def _is_broadcast_channel(uc: Client, ch_id) -> bool:
+    try:
+        chat = await uc.get_chat(ch_id)
+        return chat.type == ChatType.CHANNEL
+    except Exception:
+        return True
+
+
+async def _raw_edit_bot_admin(uc: Client, ch_id, bot_id) -> str | None:
+    """Fallback raw EditAdmin — promote bot làm admin kênh broadcast."""
+    try:
+        from pyrogram.raw import functions, types
+        channel = await uc.resolve_peer(ch_id)
+        user    = await uc.resolve_peer(bot_id)
+        rights  = types.ChatAdminRights(
+            change_info=False,
+            post_messages=True,
+            edit_messages=True,
+            delete_messages=True,
+            ban_users=False,
+            invite_users=False,
+            pin_messages=False,
+            add_admins=False,
+            anonymous=False,
+            manage_call=False,
+            other=False,
+        )
+        await uc.invoke(functions.channels.EditAdmin(
+            channel=channel,
+            user_id=user,
+            admin_rights=rights,
+            rank="",
+        ))
+        return None
+    except FloodWait as e:
+        await asyncio.sleep(e.value + 2)
+        return await _raw_edit_bot_admin(uc, ch_id, bot_id)
+    except Exception as e:
+        return f"raw admin: {type(e).__name__}: {str(e)[:100]}"
+
+
+async def _install_bot_as_admin(uc: Client, ch_id, bot_id, bot_target) -> str | None:
+    """
+    Thêm bot làm admin kênh.
+    Kênh broadcast: bot CHỈ được là admin — không dùng add_chat_members.
+  Supergroup: có thể add member rồi promote.
+    """
+    is_channel = await _is_broadcast_channel(uc, ch_id)
+
+    if is_channel:
+        for target in (bot_target, bot_id):
+            err = await _promote_bot_in_channel(uc, ch_id, target)
+            if not err:
+                return None
+        return await _raw_edit_bot_admin(uc, ch_id, bot_id)
+
+    err = await _promote_bot_in_channel(uc, ch_id, bot_id)
+    if not err:
+        return None
+
+    invite_err = await _invite_bot_to_channel(uc, ch_id, bot_target)
+    if invite_err and "USER_BOT" not in str(invite_err).upper():
+        return invite_err
+
+    return await _promote_bot_in_channel(uc, ch_id, bot_id)
+
+
 async def _invite_bot_to_channel(uc: Client, ch_id, bot_target) -> str | None:
     try:
         await uc.add_chat_members(ch_id, bot_target)
@@ -1679,13 +1746,7 @@ async def cmd_botadd_channels(
         except Exception:
             pass
 
-        err = await _invite_bot_to_channel(uc, ch_id, bot_target)
-        if err:
-            failed.append((title, err))
-            await asyncio.sleep(0.4)
-            continue
-
-        err = await _promote_bot_in_channel(uc, ch_id, bot_id)
+        err = await _install_bot_as_admin(uc, ch_id, bot_id, bot_target)
         if err:
             failed.append((title, err))
             await asyncio.sleep(0.4)
