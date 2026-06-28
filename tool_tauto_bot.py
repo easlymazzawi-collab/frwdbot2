@@ -452,7 +452,14 @@ async def _resolve_bot_ads_chat():
     Thử: get_chat(id/@username) → get_chat_member(bot) → user session ref.
     """
     global ads_chat_resolved, ads_bot_accessible
-    ads_bot_accessible = False
+
+    if ads_bot_accessible:
+        try:
+            chat = await app.get_chat(get_ads_chat_id())
+            ads_chat_resolved = chat.id
+            return chat
+        except Exception:
+            ads_bot_accessible = False
 
     target   = ADS_CHAT
     user_ref = None
