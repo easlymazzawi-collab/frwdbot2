@@ -527,6 +527,16 @@ async def _resolve_bot_ads_chat():
     return None
 
 
+async def mark_ads_chat_live(chat_id: int, title: str = ""):
+    """Bot nhận tin trong nhóm ads → cache peer, copy ads trực tiếp được."""
+    global ads_chat_resolved, ads_bot_accessible
+    if ads_bot_accessible and ads_chat_resolved == chat_id:
+        return
+    ads_chat_resolved  = chat_id
+    ads_bot_accessible = True
+    log("ADS", f"✓ Bot live trong '{title or chat_id}' — copy ads qua bot OK")
+
+
 async def resolve_ads_chat_for_bot() -> bool:
     chat = await _resolve_bot_ads_chat()
     if chat and ads_bot_accessible:
